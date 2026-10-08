@@ -110,6 +110,14 @@ class EditorRunBar : public MarginContainer {
 	void _finish_cargo_build(int p_exit_code);
 	void _cancel_cargo_build();
 	void _cargo_append(const String &p_text);
+	void _cargo_apply_sgr(const String &p_params);
+	void _cargo_restyle();
+
+	// ANSI colors in the build output.
+	String cargo_ansi_pending;
+	Color cargo_fg;
+	bool cargo_has_fg = false;
+	bool cargo_bold = false;
 
 	void _reset_play_buttons();
 	void _update_play_buttons();

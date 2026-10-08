@@ -83,6 +83,7 @@ void EditorRunBar::_notification(int p_what) {
 
 		case NOTIFICATION_THEME_CHANGED: {
 			cargo_output->add_theme_font_override("normal_font", get_theme_font(SNAME("output_source"), EditorStringName(EditorFonts)));
+			cargo_output->add_theme_font_override("bold_font", get_theme_font(SNAME("output_source_bold"), EditorStringName(EditorFonts)));
 			cargo_output->add_theme_font_size_override("normal_font_size", get_theme_font_size(SNAME("output_source_size"), EditorStringName(EditorFonts)));
 
 			if (Engine::get_singleton()->is_recovery_mode_hint()) {
@@ -412,12 +413,12 @@ bool EditorRunBar::_start_cargo_build(const String &p_scene_path, const Vector<S
 	if (OS::get_singleton()->get_name() == "Windows") {
 		shell = "cmd";
 		args.push_back("/C");
-		args.push_back(vformat("cd /d \"%s\" && cargo build", rust_dir.replace("/", "\\")));
+		args.push_back(vformat("set CARGO_TERM_COLOR=always&& cd /d \"%s\" && cargo build", rust_dir.replace("/", "\\")));
 	} else {
 		// GUI-launched editors often lack ~/.cargo/bin in PATH.
 		shell = "/bin/sh";
 		args.push_back("-c");
-		args.push_back("export PATH=\"$HOME/.cargo/bin:$PATH\" CARGO_TERM_COLOR=never; cd \"$1\" && exec cargo build");
+		args.push_back("export PATH=\"$HOME/.cargo/bin:$PATH\" CARGO_TERM_COLOR=always; cd \"$1\" && exec cargo build");
 		args.push_back("sh");
 		args.push_back(rust_dir);
 	}
@@ -437,6 +438,9 @@ bool EditorRunBar::_start_cargo_build(const String &p_scene_path, const Vector<S
 	cargo_pending_args = p_run_args;
 
 	cargo_output->clear();
+	cargo_ansi_pending = String();
+	cargo_has_fg = false;
+	cargo_bold = false;
 	_cargo_append("$ cd " + rust_dir + "\n$ cargo build\n\n");
 	cargo_dialog->set_title(TTR("Building Rust (cargo build)..."));
 	cargo_dialog->set_ok_button_text(TTR("Cancel"));
@@ -447,8 +451,104 @@ bool EditorRunBar::_start_cargo_build(const String &p_scene_path, const Vector<S
 	return true;
 }
 
+void EditorRunBar::_cargo_restyle() {
+	cargo_output->pop_all();
+	if (cargo_has_fg) {
+		cargo_output->push_color(cargo_fg);
+	}
+	if (cargo_bold) {
+		cargo_output->push_bold();
+	}
+}
+
+void EditorRunBar::_cargo_apply_sgr(const String &p_params) {
+	static const Color palette[8] = {
+		Color(0.45, 0.45, 0.45), Color(0.94, 0.33, 0.31), Color(0.4, 0.8, 0.4), Color(0.95, 0.8, 0.3),
+		Color(0.4, 0.6, 0.95), Color(0.8, 0.5, 0.9), Color(0.4, 0.8, 0.85), Color(0.85, 0.85, 0.85)
+	};
+	const Vector<String> parts = p_params.is_empty() ? Vector<String>{ "0" } : p_params.split(";", true);
+	for (int i = 0; i < parts.size(); i++) {
+		const int code = parts[i].is_empty() ? 0 : parts[i].to_int();
+		if (code == 0) {
+			cargo_has_fg = false;
+			cargo_bold = false;
+		} else if (code == 1) {
+			cargo_bold = true;
+		} else if (code == 22) {
+			cargo_bold = false;
+		} else if (code >= 30 && code <= 37) {
+			cargo_fg = palette[code - 30];
+			cargo_has_fg = true;
+		} else if (code >= 90 && code <= 97) {
+			cargo_fg = palette[code - 90].lightened(0.25);
+			cargo_has_fg = true;
+		} else if (code == 39) {
+			cargo_has_fg = false;
+		} else if (code == 38 && i + 1 < parts.size()) {
+			// Extended foreground: 38;5;n (256 colors) or 38;2;r;g;b.
+			if (parts[i + 1] == "5" && i + 2 < parts.size()) {
+				const int n = parts[i + 2].to_int();
+				if (n < 8) {
+					cargo_fg = palette[n];
+				} else if (n < 16) {
+					cargo_fg = palette[n - 8].lightened(0.25);
+				} else {
+					cargo_fg = Color(0.85, 0.85, 0.85);
+				}
+				cargo_has_fg = true;
+				i += 2;
+			} else if (parts[i + 1] == "2" && i + 4 < parts.size()) {
+				cargo_fg = Color::from_rgba8(parts[i + 2].to_int(), parts[i + 3].to_int(), parts[i + 4].to_int());
+				cargo_has_fg = true;
+				i += 4;
+			}
+		}
+	}
+	_cargo_restyle();
+}
+
 void EditorRunBar::_cargo_append(const String &p_text) {
-	cargo_output->add_text(p_text);
+	// Plain text is added as-is; ANSI "SGR" escapes (colors, bold) become styles, other escapes are dropped.
+	// An escape sequence split across two reads is held back in `cargo_ansi_pending`.
+	const String text = cargo_ansi_pending + p_text;
+	cargo_ansi_pending = String();
+	const int len = text.length();
+	int start = 0;
+	int i = 0;
+	while (i < len) {
+		if (text[i] != 0x1b) {
+			i++;
+			continue;
+		}
+		if (i > start) {
+			cargo_output->add_text(text.substr(start, i - start));
+		}
+		if (i + 1 >= len) {
+			cargo_ansi_pending = text.substr(i);
+			return;
+		}
+		if (text[i + 1] != '[') {
+			i += 2;
+			start = i;
+			continue;
+		}
+		int j = i + 2;
+		while (j < len && !(text[j] >= 0x40 && text[j] <= 0x7e)) {
+			j++;
+		}
+		if (j >= len) {
+			cargo_ansi_pending = text.substr(i);
+			return;
+		}
+		if (text[j] == 'm') {
+			_cargo_apply_sgr(text.substr(i + 2, j - i - 2));
+		}
+		i = j + 1;
+		start = i;
+	}
+	if (start < len) {
+		cargo_output->add_text(text.substr(start));
+	}
 }
 
 void EditorRunBar::_poll_cargo_build() {
@@ -497,7 +597,7 @@ void EditorRunBar::_finish_cargo_build(int p_exit_code) {
 
 	current_mode = RunMode::STOPPED;
 	_update_play_buttons();
-	_cargo_append(vformat("\n`cargo build` failed (exit code %d). The project was not launched.\n", p_exit_code));
+	_cargo_append(vformat("\x1b[0m\n\x1b[1;31m`cargo build` failed (exit code %d). The project was not launched.\x1b[0m\n", p_exit_code));
 	cargo_dialog->set_title(TTR("Rust build failed"));
 	cargo_dialog->set_ok_button_text(TTR("Close"));
 	cargo_dialog->popup_centered_ratio(0.5);
