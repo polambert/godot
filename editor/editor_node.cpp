@@ -35,6 +35,7 @@
 #include "core/extension/gdextension_manager.h"
 #include "core/input/input.h"
 #include "core/io/config_file.h"
+#include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/io/image.h"
 #include "core/io/missing_resource.h"
@@ -365,9 +366,47 @@ void EditorNode::_version_control_menu_option(int p_idx) {
 	}
 }
 
+// Returns the current git branch of the project (or a short commit hash when detached), or an empty string.
+static String _get_project_git_branch() {
+	String dir = ProjectSettings::get_singleton()->get_resource_path();
+	while (!dir.is_empty()) {
+		const String dot_git = dir.path_join(".git");
+		String git_dir;
+		if (DirAccess::dir_exists_absolute(dot_git)) {
+			git_dir = dot_git;
+		} else if (FileAccess::exists(dot_git)) {
+			// Worktrees and submodules: ".git" is a file reading "gitdir: <path>".
+			const String line = FileAccess::get_file_as_string(dot_git).strip_edges();
+			if (line.begins_with("gitdir:")) {
+				git_dir = line.substr(7).strip_edges();
+				if (git_dir.is_relative_path()) {
+					git_dir = dir.path_join(git_dir).simplify_path();
+				}
+			}
+		}
+		if (!git_dir.is_empty()) {
+			const String head = FileAccess::get_file_as_string(git_dir.path_join("HEAD")).strip_edges();
+			if (head.begins_with("ref:")) {
+				return head.substr(4).strip_edges().trim_prefix("refs/heads/");
+			}
+			return head.substr(0, 7);
+		}
+		const String parent = dir.get_base_dir();
+		if (parent == dir) {
+			break;
+		}
+		dir = parent;
+	}
+	return String();
+}
+
 void EditorNode::_update_title() {
 	const String appname = GLOBAL_GET("application/config/name");
 	String title = (appname.is_empty() ? TTR("Unnamed Project") : appname);
+	const String branch = _get_project_git_branch();
+	if (!branch.is_empty()) {
+		title += vformat(" [%s]", branch);
+	}
 	const String edited = editor_data.get_edited_scene_root() ? editor_data.get_edited_scene_root()->get_scene_file_path() : String();
 	if (!edited.is_empty()) {
 		// Display the edited scene name before the program name so that it can be seen in the OS task bar.
