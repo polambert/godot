@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include "core/io/file_access.h"
 #include "core/os/process_id.h"
 #include "editor/run/editor_run.h"
 #include "scene/gui/margin_container.h"
@@ -41,6 +42,7 @@ class EditorRunNative;
 class HBoxContainer;
 class MenuButton;
 class PanelContainer;
+class RichTextLabel;
 
 class EditorRunBar : public MarginContainer {
 	GDCLASS(EditorRunBar, MarginContainer);
@@ -91,6 +93,23 @@ class EditorRunBar : public MarginContainer {
 	RunMode current_mode = RunMode::STOPPED;
 	String run_custom_filename;
 	String run_current_filename;
+
+	// Rust (cargo) build that must finish before the project is launched.
+	AcceptDialog *cargo_dialog = nullptr;
+	RichTextLabel *cargo_output = nullptr;
+	Ref<FileAccess> cargo_stdout;
+	Ref<FileAccess> cargo_stderr;
+	ProcessID cargo_pid = 0;
+	bool cargo_running = false;
+	bool cargo_build_passed = false;
+	String cargo_pending_scene;
+	Vector<String> cargo_pending_args;
+
+	bool _start_cargo_build(const String &p_scene_path, const Vector<String> &p_run_args);
+	void _poll_cargo_build();
+	void _finish_cargo_build(int p_exit_code);
+	void _cancel_cargo_build();
+	void _cargo_append(const String &p_text);
 
 	void _reset_play_buttons();
 	void _update_play_buttons();

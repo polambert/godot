@@ -32,7 +32,9 @@
 
 #include "core/config/engine.h"
 #include "core/config/project_settings.h"
+#include "core/io/dir_access.h"
 #include "core/object/callable_mp.h"
+#include "core/os/os.h"
 #include "editor/debugger/editor_debugger_node.h"
 #include "editor/debugger/script_editor_debugger.h"
 #include "editor/editor_node.h"
@@ -49,6 +51,8 @@
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
 #include "scene/gui/button.h"
+#include "scene/gui/dialogs.h"
+#include "scene/gui/rich_text_label.h"
 #include "scene/gui/menu_button.h"
 #include "scene/gui/panel_container.h"
 #include "scene/main/scene_tree.h"
@@ -65,6 +69,12 @@ void EditorRunBar::_notification(int p_what) {
 			_reset_play_buttons();
 		} break;
 
+		case NOTIFICATION_INTERNAL_PROCESS: {
+			if (cargo_running) {
+				_poll_cargo_build();
+			}
+		} break;
+
 		case NOTIFICATION_READY: {
 			if (Engine::get_singleton()->is_recovery_mode_hint()) {
 				recovery_mode_show_dialog();
@@ -72,6 +82,9 @@ void EditorRunBar::_notification(int p_what) {
 		} break;
 
 		case NOTIFICATION_THEME_CHANGED: {
+			cargo_output->add_theme_font_override("normal_font", get_theme_font(SNAME("output_source"), EditorStringName(EditorFonts)));
+			cargo_output->add_theme_font_size_override("normal_font_size", get_theme_font_size(SNAME("output_source_size"), EditorStringName(EditorFonts)));
+
 			if (Engine::get_singleton()->is_recovery_mode_hint()) {
 				main_panel->add_theme_style_override(SceneStringName(panel), get_theme_stylebox(SNAME("LaunchPadRecoveryMode"), EditorStringName(EditorStyles)));
 				recovery_mode_panel->add_theme_style_override(SceneStringName(panel), get_theme_stylebox(SNAME("RecoveryModeButton"), EditorStringName(EditorStyles)));
@@ -347,6 +360,13 @@ void EditorRunBar::_run_scene(const String &p_scene_path, const Vector<String> &
 		} break;
 	}
 
+	// Build the Rust side first. The run resumes from `_finish_cargo_build()` once it succeeds.
+	if (!cargo_build_passed) {
+		_start_cargo_build(p_scene_path, p_run_args);
+		return;
+	}
+	cargo_build_passed = false;
+
 	EditorNode::get_singleton()->try_autosave();
 	if (!EditorNode::get_singleton()->call_build()) {
 		return;
@@ -372,6 +392,128 @@ void EditorRunBar::_run_scene(const String &p_scene_path, const Vector<String> &
 	stop_button->set_disabled(false);
 
 	emit_signal(SNAME("play_pressed"));
+}
+
+bool EditorRunBar::_start_cargo_build(const String &p_scene_path, const Vector<String> &p_run_args) {
+	if (cargo_running) {
+		cargo_dialog->popup_centered();
+		return false;
+	}
+
+	const String rust_dir = ProjectSettings::get_singleton()->get_resource_path().path_join("../rust").simplify_path();
+	if (!FileAccess::exists(rust_dir.path_join("Cargo.toml"))) {
+		current_mode = RunMode::STOPPED;
+		EditorNode::get_singleton()->show_warning(vformat(TTR("Cannot run `cargo build`: no Cargo.toml found in \"%s\"."), rust_dir), TTR("Error!"));
+		return false;
+	}
+
+	List<String> args;
+	String shell;
+	if (OS::get_singleton()->get_name() == "Windows") {
+		shell = "cmd";
+		args.push_back("/C");
+		args.push_back(vformat("cd /d \"%s\" && cargo build", rust_dir.replace("/", "\\")));
+	} else {
+		// GUI-launched editors often lack ~/.cargo/bin in PATH.
+		shell = "/bin/sh";
+		args.push_back("-c");
+		args.push_back("export PATH=\"$HOME/.cargo/bin:$PATH\" CARGO_TERM_COLOR=never; cd \"$1\" && exec cargo build");
+		args.push_back("sh");
+		args.push_back(rust_dir);
+	}
+
+	Dictionary pipe_info = OS::get_singleton()->execute_with_pipe(shell, args, false);
+	if (pipe_info.is_empty()) {
+		current_mode = RunMode::STOPPED;
+		EditorNode::get_singleton()->show_warning(TTR("Failed to start `cargo build`."), TTR("Error!"));
+		return false;
+	}
+
+	cargo_stdout = pipe_info["stdio"];
+	cargo_stderr = pipe_info["stderr"];
+	cargo_pid = pipe_info["pid"];
+	cargo_running = true;
+	cargo_pending_scene = p_scene_path;
+	cargo_pending_args = p_run_args;
+
+	cargo_output->clear();
+	_cargo_append("$ cd " + rust_dir + "\n$ cargo build\n\n");
+	cargo_dialog->set_title(TTR("Building Rust (cargo build)..."));
+	cargo_dialog->set_ok_button_text(TTR("Cancel"));
+	cargo_dialog->popup_centered_ratio(0.5);
+
+	stop_button->set_disabled(false);
+	set_process_internal(true);
+	return true;
+}
+
+void EditorRunBar::_cargo_append(const String &p_text) {
+	cargo_output->add_text(p_text);
+}
+
+void EditorRunBar::_poll_cargo_build() {
+	uint8_t buf[4096];
+	for (const Ref<FileAccess> &fa : { cargo_stdout, cargo_stderr }) {
+		if (fa.is_null()) {
+			continue;
+		}
+		while (true) {
+			uint64_t got = fa->get_buffer(buf, sizeof(buf));
+			if (got == 0) {
+				break;
+			}
+			_cargo_append(String::utf8((const char *)buf, got));
+		}
+	}
+
+	if (!OS::get_singleton()->is_process_running(cargo_pid)) {
+		// Drain whatever arrived between the last read and the exit.
+		for (const Ref<FileAccess> &fa : { cargo_stdout, cargo_stderr }) {
+			while (fa.is_valid()) {
+				uint64_t got = fa->get_buffer(buf, sizeof(buf));
+				if (got == 0) {
+					break;
+				}
+				_cargo_append(String::utf8((const char *)buf, got));
+			}
+		}
+		_finish_cargo_build(OS::get_singleton()->get_process_exit_code(cargo_pid));
+	}
+}
+
+void EditorRunBar::_finish_cargo_build(int p_exit_code) {
+	set_process_internal(false);
+	cargo_running = false;
+	cargo_stdout.unref();
+	cargo_stderr.unref();
+
+	if (p_exit_code == 0) {
+		cargo_dialog->hide();
+		cargo_build_passed = true;
+		_run_scene(cargo_pending_scene, cargo_pending_args);
+		cargo_build_passed = false; // In case `_run_scene()` bailed out before consuming it.
+		return;
+	}
+
+	current_mode = RunMode::STOPPED;
+	_update_play_buttons();
+	_cargo_append(vformat("\n`cargo build` failed (exit code %d). The project was not launched.\n", p_exit_code));
+	cargo_dialog->set_title(TTR("Rust build failed"));
+	cargo_dialog->set_ok_button_text(TTR("Close"));
+	cargo_dialog->popup_centered_ratio(0.5);
+}
+
+void EditorRunBar::_cancel_cargo_build() {
+	if (!cargo_running) {
+		return;
+	}
+	OS::get_singleton()->kill(cargo_pid);
+	set_process_internal(false);
+	cargo_running = false;
+	cargo_stdout.unref();
+	cargo_stderr.unref();
+	current_mode = RunMode::STOPPED;
+	_update_play_buttons();
 }
 
 void EditorRunBar::_run_native(const Ref<EditorExportPreset> &p_preset) {
@@ -460,6 +602,8 @@ void EditorRunBar::play_custom_scene(const String &p_custom, const Vector<String
 }
 
 void EditorRunBar::stop_playing() {
+	_cancel_cargo_build();
+
 	if (editor_run.get_status() == EditorRun::STATUS_STOP) {
 		return;
 	}
@@ -557,6 +701,20 @@ void EditorRunBar::_bind_methods() {
 
 EditorRunBar::EditorRunBar() {
 	singleton = this;
+
+	cargo_dialog = memnew(AcceptDialog);
+	cargo_dialog->set_title(TTR("Building Rust (cargo build)..."));
+	cargo_dialog->set_exclusive(false);
+	add_child(cargo_dialog);
+	cargo_dialog->connect(SceneStringName(confirmed), callable_mp(this, &EditorRunBar::_cancel_cargo_build));
+	cargo_dialog->connect("canceled", callable_mp(this, &EditorRunBar::_cancel_cargo_build));
+
+	cargo_output = memnew(RichTextLabel);
+	cargo_output->set_custom_minimum_size(Size2(600, 300) * EDSCALE);
+	cargo_output->set_selection_enabled(true);
+	cargo_output->set_scroll_follow(true);
+	cargo_output->set_v_size_flags(SIZE_EXPAND_FILL);
+	cargo_dialog->add_child(cargo_output);
 
 	outer_hbox = memnew(HBoxContainer);
 	add_child(outer_hbox);
